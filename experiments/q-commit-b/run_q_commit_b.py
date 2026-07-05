@@ -71,12 +71,14 @@ def run_one(question):
     probs = [torch.softmax(s[0].float(), dim=-1).cpu().numpy() for s in out.scores]  # one (vocab,) per step
     return probs, gen_text
 
+from geometry import geom_features, entropy_features   # compute per-question, then DISCARD probs (memory)
 records = []
 for i, ex in enumerate(gsm):
-    probs, gen = run_one(ex["question"])
+    probs, gen = run_one(ex["question"])               # probs ~150 MB (≈250 steps x 152k vocab) -- TRANSIENT
     pred, gold = parse_pred(gen), gold_answer(ex["answer"])
-    records.append(dict(i=i, probs=probs, gen=gen, pred=pred, gold=gold,
-                        correct=is_correct(pred, gold)))
+    records.append(dict(i=i, gen=gen, pred=pred, gold=gold, correct=is_correct(pred, gold),
+                        geom=geom_features(probs), ent=entropy_features(probs)))  # keep only small features
+    del probs                                          # free the big array NOW (was the RAM blow-out ~Q40)
     if i % 20 == 0: print(f"{i}/100 | acc-so-far {np.mean([r['correct'] for r in records]):.2f}")
 print("overall accuracy:", np.mean([r["correct"] for r in records]))
 
@@ -85,10 +87,7 @@ print("overall accuracy:", np.mean([r["correct"] for r in records]))
 # Verified locally by test_geometry.py: 21/21 PASS (Fisher-Rao, Menger, entropy, spearman, primary+null).
 from geometry import d_fr, menger_curv, geom_features, entropy_features, spearman, bootstrap_diff
 
-# %% [5] compute features (geometry + tier-1 entropy of the SAME distributions) ----
-
-for r in records:
-    r["geom"] = geom_features(r["probs"]); r["ent"] = entropy_features(r["probs"])
+# %% [5] filter to usable questions (features already computed per-question in cell 3; no raw probs kept) ----
 valid = [r for r in records if r["geom"] and r["ent"]]
 print("usable questions:", len(valid))
 
@@ -119,13 +118,14 @@ def step_prefixes(gen):                   # segment CoT into step prefixes (thei
     if len(marks) < 2: marks = [m.start() for m in re.finditer(r"\n\n", gen)]
     return [gen[:m] for m in marks] or [gen[:len(gen)//2]]
 
+@torch.no_grad()
 def answer_entropy_at(question, prefix):
-    p = build_prompt(question) + prefix
+    inputs = tok(build_prompt(question) + prefix, return_tensors="pt").to(model.device)
     ans = []
     for _ in range(M):
-        with model.generate(p, max_new_tokens=150, do_sample=True, temperature=0.7) as tr:
-            o = tr.result.save()
-        ans.append(parse_pred(tok.decode(o[0], skip_special_tokens=True)))
+        o = model.generate(**inputs, max_new_tokens=150, do_sample=True, temperature=0.7,
+                           pad_token_id=tok.eos_token_id)
+        ans.append(parse_pred(tok.decode(o[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)))
     c = Counter(ans); tot = sum(c.values())
     return -sum((n/tot) * np.log(n/tot) for n in c.values())
 
