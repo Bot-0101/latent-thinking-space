@@ -1,20 +1,22 @@
 # Q-COMMIT-B — does output-simplex curvature predict CoT correctness beyond entropy?
-# Colab / Jupyter notebook as ordered `# %%` cells. Subject: Qwen2.5-1.5B-Instruct (nnsight). Seed 42.
+# Colab / Jupyter notebook as ordered `# %%` cells. Subject: Qwen2.5-1.5B-Instruct (HF transformers). Seed 42.
 # Design + pre-registration: experiments/q-commit-b/problem-statement.md
 # NOTE: runs on Colab GPU (not locally). Cells flagged [RUNTIME-VERIFY] have one API/shape detail to eyeball on first run.
 
 # %% [0] setup ---------------------------------------------------------------
-# !pip install -q nnsight datasets
+# !pip install -q transformers datasets accelerate
 import torch, numpy as np, random, json, os, re
 from collections import Counter
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 SEED = 42
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 RESULTS = "results"; os.makedirs(RESULTS, exist_ok=True)
 
-from nnsight import LanguageModel
-model = LanguageModel("Qwen/Qwen2.5-1.5B-Instruct", device_map="auto", torch_dtype=torch.float32)
-tok = model.tokenizer
+# Signal B needs only OUTPUT next-token distributions -> plain transformers (no nnsight; Signal A was dropped).
+MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(MODEL)
+model = AutoModelForCausalLM.from_pretrained(MODEL, device_map="auto", torch_dtype=torch.float32).eval()
 print("vocab_size:", model.config.vocab_size)   # EXPECT 151936
 
 # %% [1] SANITY / tokenizer-first (repo rule: a silent format bug corrupts everything) -------
@@ -33,9 +35,10 @@ ids = tok(p, return_tensors="pt")["input_ids"][0]
 print([tok.decode([t]) for t in ids[-12:]])
 
 # trivial known behaviour: greedy-generate a short answer, eyeball coherence
-with model.generate(p, max_new_tokens=80, do_sample=False) as tracer:
-    out = tracer.result.save()          # [RUNTIME-VERIFY] tracer.result holds generated ids
-print("=== SAMPLE GENERATION ===\n", tok.decode(out[0][ids.shape[0]:], skip_special_tokens=True))
+with torch.no_grad():
+    o = model.generate(**tok(p, return_tensors="pt").to(model.device), max_new_tokens=80,
+                       do_sample=False, pad_token_id=tok.eos_token_id)
+print("=== SAMPLE GENERATION ===\n", tok.decode(o[0][ids.shape[0]:], skip_special_tokens=True))
 # STOP-CHECK: read the above. If the template/answer looks wrong, fix before proceeding.
 
 # %% [2] data + answer parsing ----------------------------------------------
@@ -53,18 +56,17 @@ def is_correct(pred, gold):
     except ValueError: return False
 
 # %% [3] generate CoT + capture the RAW per-step next-token distributions -----
-# Verified nnsight pattern: tracer.iter[:] + model.lm_head.output[0, -1] = next-token logits each decode step.
+# transformers generate(output_scores=True) returns one [1,vocab] logit tensor per token ACTUALLY generated
+# (stops at EOS cleanly, no phantom iterations). Under greedy (no warpers) scores==logits, so softmax = the dist.
 MAXNEW = 320
+@torch.no_grad()
 def run_one(question):
-    p = build_prompt(question)
-    with model.generate(p, max_new_tokens=MAXNEW, do_sample=False) as tracer:
-        step_logits = list().save()
-        for _ in tracer.iter[:]:
-            step_logits.append(model.lm_head.output[0, -1].save())   # [RUNTIME-VERIFY] shape [vocab]
-        out = tracer.result.save()
-    n_prompt = tok(p, return_tensors="pt")["input_ids"].shape[1]
-    gen_text = tok.decode(out[0][n_prompt:], skip_special_tokens=True)
-    probs = [torch.softmax(l.float(), dim=-1).cpu().numpy() for l in step_logits]  # list of (vocab,)
+    inputs = tok(build_prompt(question), return_tensors="pt").to(model.device)
+    out = model.generate(**inputs, max_new_tokens=MAXNEW, do_sample=False,
+                         output_scores=True, return_dict_in_generate=True, pad_token_id=tok.eos_token_id)
+    gen_ids = out.sequences[0][inputs["input_ids"].shape[1]:]
+    gen_text = tok.decode(gen_ids, skip_special_tokens=True)
+    probs = [torch.softmax(s[0].float(), dim=-1).cpu().numpy() for s in out.scores]  # one (vocab,) per step
     return probs, gen_text
 
 records = []
