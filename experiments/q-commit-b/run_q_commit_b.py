@@ -47,10 +47,12 @@ gsm = load_dataset("gsm8k", "main")["test"].select(range(100))   # first 100 tes
 
 def gold_answer(a):                       # gold format: "... #### 72"
     m = re.search(r"####\s*([-0-9,\.]+)", a); return m.group(1).replace(",", "").strip() if m else None
-def parse_pred(text):                     # our prompt asks for "The answer is N."
-    m = re.findall(r"answer is\s*\$?([-0-9,\.]+)", text, flags=re.I)
-    if not m:  m = re.findall(r"([-0-9,\.]+)", text)          # fallback: last number
-    return m[-1].replace(",", "").strip() if m else None
+def parse_pred(text):                     # robust: model uses LaTeX \boxed{}, echoes "The answer is N.", etc.
+    text = re.sub(r"\\boxed\{([^{}]*)\}", r" \1 ", text)      # unwrap \boxed{50} -> 50
+    NUM = r"[-+]?[0-9][0-9,]*(?:\.[0-9]+)?"                   # MUST start with a digit (no lone '.' / ',')
+    m = re.findall(rf"answer\s*(?:is|=|:)\s*\$?\(?\s*({NUM})", text, flags=re.I)  # prefer explicit marker
+    if not m:  m = re.findall(NUM, text)                      # fallback: last real number in the text
+    return m[-1].replace(",", "").rstrip(".") if m else None
 def is_correct(pred, gold):
     try: return pred is not None and gold is not None and abs(float(pred) - float(gold)) < 1e-6
     except ValueError: return False
@@ -58,7 +60,7 @@ def is_correct(pred, gold):
 # %% [3] generate CoT + capture the RAW per-step next-token distributions -----
 # transformers generate(output_scores=True) returns one [1,vocab] logit tensor per token ACTUALLY generated
 # (stops at EOS cleanly, no phantom iterations). Under greedy (no warpers) scores==logits, so softmax = the dist.
-MAXNEW = 320
+MAXNEW = 512   # was 320; verbose LaTeX CoT overflowed it -> truncated tails -> mislabeled wrong
 @torch.no_grad()
 def run_one(question):
     inputs = tok(build_prompt(question), return_tensors="pt").to(model.device)
